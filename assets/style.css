@@ -1,0 +1,33 @@
+.info-icone {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+}
+
+.info-bulle {
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  position: absolute;
+  z-index: 20;
+  top: 130%;
+  left: 0;
+  width: 360px;
+  max-width: 80vw;
+  background: #2b2b2b;
+  color: #f0f0f0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-line;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+}
+
+.info-icone:hover .info-bulle {
+  visibility: visible;
+  opacity: 1;
+}
