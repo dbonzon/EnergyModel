@@ -19,6 +19,28 @@ import pandas as pd
 # Pouvoir calorifique du mazout extra-léger (valeur standard Suisse)
 PCI_MAZOUT_KWH_PAR_LITRE = 10.0
 
+# Pouvoir calorifique du gaz naturel distribué en Suisse — valeur approximative
+# générique (varie ~10.0-10.5 kWh/m³ selon la composition/le fournisseur) ;
+# ajuste avec la valeur exacte de ta facture si disponible (souvent indiquée).
+PCI_GAZ_KWH_PAR_M3 = 10.0
+
+UNITES_ENERGIE = {
+    "mazout_l": {"label": "Mazout (litres)", "pci": PCI_MAZOUT_KWH_PAR_LITRE},
+    "gaz_m3": {"label": "Gaz naturel (m³)", "pci": PCI_GAZ_KWH_PAR_M3},
+    "kwh_direct": {"label": "Énergie directe (kWh)", "pci": 1.0},
+}
+
+
+def convertir_energie_vers_kwh(valeur: float, unite: str) -> float:
+    """
+    Convertit une quantité d'énergie saisie dans l'unité choisie (litres de
+    mazout, m³ de gaz, ou kWh directs) en kWh bruts — même grandeur physique
+    que ce que le reste du pipeline (calibration H, coût) attend déjà.
+    """
+    if unite not in UNITES_ENERGIE:
+        raise ValueError(f"Unité inconnue : {unite!r} — attendu l'une de {list(UNITES_ENERGIE)}")
+    return valeur * UNITES_ENERGIE[unite]["pci"]
+
 # Rendement de combustion/distribution typique d'une chaudière mazout
 # existante — à ajuster selon l'âge/état réel de l'installation.
 RENDEMENT_CHAUDIERE_DEFAUT = 0.85
@@ -323,4 +345,56 @@ def calculer_cout_annuel_bitarif_masque_chf(
         "kwh_hc": kwh_hc, "kwh_hp": kwh_hp,
         "cout_hc_chf": cout_hc, "cout_hp_chf": cout_hp,
         "cout_total_chf": cout_hc + cout_hp,
+    }
+
+
+def calibrer_coefficient_deperdition_regression(
+    dh_mensuel: np.ndarray,
+    energie_mensuelle_kwh: np.ndarray,
+    rendement_chaudiere: float = RENDEMENT_CHAUDIERE_DEFAUT,
+) -> dict:
+    """
+    Calibre H par régression linéaire (méthode "signature énergétique" OFEN)
+    à partir de 12 points mensuels, au lieu d'une simple division sur le
+    total annuel — permet de SÉPARER la charge de chauffage de la charge de
+    base (eau chaude sanitaire, ECS), qui existe même en été (DH mensuel ≈ 0).
+
+    Modèle : énergie_utile_mois = H x DH_mois + base_mensuelle
+      - H (pente) = coefficient de déperdition du bâtiment (kW/°C)
+      - base_mensuelle (ordonnée à l'origine) = charge de base mensuelle
+        (ECS essentiellement), indépendante du DH — estimée automatiquement
+        par la régression, pas besoin de l'isoler à la main.
+
+    Args:
+        dh_mensuel: 12 valeurs de DH total par mois (°C·h), même année que
+            energie_mensuelle_kwh
+        energie_mensuelle_kwh: 12 valeurs d'énergie BRUTE mazout/gaz par mois
+            (kWh, avant rendement chaudière)
+        rendement_chaudiere: pour convertir l'énergie brute en énergie utile
+            avant régression (cohérent avec calibrer_coefficient_deperdition)
+
+    Returns:
+        dict avec H (kW/°C), base_mensuelle_kwh, base_annuelle_kwh (estimation ECS),
+        et r2 (qualité d'ajustement, 1.0 = parfait)
+    """
+    dh = np.asarray(dh_mensuel, dtype=float)
+    energie_utile = np.asarray(energie_mensuelle_kwh, dtype=float) * rendement_chaudiere
+
+    if len(dh) != 12 or len(energie_utile) != 12:
+        raise ValueError("Régression attendue sur exactement 12 points mensuels.")
+    if np.all(dh == dh[0]):
+        raise ValueError("DH mensuel constant — régression impossible (diviser par zéro).")
+
+    H, base_mensuelle = np.polyfit(dh, energie_utile, deg=1)
+
+    predite = H * dh + base_mensuelle
+    ss_res = np.sum((energie_utile - predite) ** 2)
+    ss_tot = np.sum((energie_utile - energie_utile.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    return {
+        "H": H,
+        "base_mensuelle_kwh": base_mensuelle,
+        "base_annuelle_kwh": base_mensuelle * 12,
+        "r2": r2,
     }

@@ -9,9 +9,25 @@ import pac
 app = Dash(__name__)
 server = app.server
 
-# --- Calculs indépendants des sliders : faits une seule fois au démarrage ---
-# Placer le fichier .dat MétéoSuisse à côté de app.py, ou ajuster le chemin ci-dessous.
-temp_pully = climat.charger_temperature_meteosuisse("Data/T2m_Pully_20220101-20221231.dat")
+# --- Chargement : fait une seule fois au démarrage, filtré par année dans le callback ---
+# Fichier OGD MétéoSuisse multi-années (remplace l'ancien export Climap mono-année).
+temp_pully_toutes_annees = climat.charger_temperature_ogd_meteosuisse(
+    "Data/ogd-smn_puy_h_historical_2020-2029.csv", station_abbr="PUY"
+)
+# Années complètes uniquement (exclut une année en cours/partielle, ex. 2026 si le fichier s'arrête au 1er janvier)
+ANNEES_DISPONIBLES = sorted(
+    annee for annee in temp_pully_toutes_annees.index.year.unique()
+    if (temp_pully_toutes_annees.index.year == annee).sum() >= 8760
+)
+
+# Indicateurs par année (donnée brute Pully, convention SIA 20/12°C — cohérent
+# avec le Graph 1), calculés une fois au démarrage pour peupler le sélecteur :
+# permet de repérer en un coup d'œil l'année la plus rigoureuse ou la plus clémente.
+STATS_PAR_ANNEE = {}
+for _annee in ANNEES_DISPONIBLES:
+    _temp_annee = temp_pully_toutes_annees[temp_pully_toutes_annees.index.year == _annee]
+    _dh_annee = climat.calculer_dh_horaire(_temp_annee, 20.0, 12.0)
+    STATS_PAR_ANNEE[_annee] = {"dh_total": _dh_annee.sum(), "temp_min": _temp_annee.min()}
 
 # Repères OFEN pour la limite de chauffage (référencés à une consigne de 20°C)
 MARQUES_LIMITE_CHAUFFE = {
@@ -34,8 +50,9 @@ EXPLICATIONS = {
         "conventionnelle en Suisse).\n\n"
         "Limite de chauffage = 12°C par défaut (réglable via le slider) : au-dessus, on suppose "
         "que les apports internes/solaires couvrent les pertes, même si l'écart à 20°C est positif.\n\n"
-        "Série de température : export horaire réel MétéoSuisse (format Climap) pour la "
-        "station de Pully, converti d'UTC en heure locale Europe/Zurich."
+        "Série de température : export horaire réel MétéoSuisse (portail OGD, 2020-2025) pour "
+        "la station de Pully, converti d'UTC en heure locale Europe/Zurich. L'année affichée se "
+        "choisit via le sélecteur en haut de page — aucune moyenne entre années."
     ),
     "construction": (
         "Même formule DH que le graph 1, mais appliquée à la température corrigée pour l'altitude "
@@ -114,9 +131,9 @@ EXPLICATIONS = {
 }
 
 
-# Masque HC par défaut : nuit 22h-6h (même motif qu'avant, mais exprimé
-# comme 24 booléens explicites — modifiable librement par clic dans l'UI)
-MASQUE_HC_DEFAUT = [1 if (h >= 22 or h < 6) else 0 for h in range(24)]
+# Masque HC par défaut : aucune heure creuse (tout en heures pleines) —
+# l'utilisateur active lui-même les heures creuses de son contrat via la grille.
+MASQUE_HC_DEFAUT = [0] * 24
 
 
 def style_bouton_heure(actif):
@@ -316,10 +333,35 @@ app.layout = html.Div(
     children=[
         html.H2("Dimensionnement PAC — pipeline degrés-heures", style={"textAlign": "center"}),
 
+        html.Div(
+            style={"display": "flex", "gap": "24px", "flexWrap": "wrap", "alignItems": "flex-start", "marginBottom": "24px"},
+            children=[
+                html.Div(
+                    id="colonne-inputs",
+                    style={"flex": "2", "minWidth": "420px"},
+                    children=[
         # --- Paramètres climat/bâtiment ---
         html.Div(
             style={"padding": "16px 24px", "border": "1px solid #ddd", "borderRadius": "8px", "marginBottom": "24px"},
             children=[
+                html.Label("Année météo (station de Pully) — change toute l'analyse"),
+                dcc.Dropdown(
+                    id="dropdown-annee",
+                    options=[
+                        {
+                            "label": (
+                                f"{a} — DH: {STATS_PAR_ANNEE[a]['dh_total']:,.0f}".replace(",", "'")
+                                + f" °C·h, min: {STATS_PAR_ANNEE[a]['temp_min']:.1f}°C"
+                            ),
+                            "value": a,
+                        }
+                        for a in ANNEES_DISPONIBLES
+                    ],
+                    value=ANNEES_DISPONIBLES[-1],
+                    clearable=False,
+                    style={"width": "320px", "marginBottom": "16px"},
+                ),
+
                 html.Label("Limite de chauffage — température extérieure sous laquelle on chauffe (échelle OFEN, °C)"),
                 dcc.Slider(
                     id="slider-limite-chauffe",
@@ -346,25 +388,33 @@ app.layout = html.Div(
             ],
         ),
 
-        # --- Paramètres calibration mazout (version test : total annuel) ---
+        # --- Paramètres calibration énergie historique (mazout/gaz/kWh, annuel ou mensuel) ---
         html.Div(
             style={"padding": "16px 24px", "border": "1px solid #ddd", "borderRadius": "8px", "marginBottom": "24px"},
             children=[
-                html.H4("Calibration — consommation mazout historique (test : total annuel)"),
-                html.P(
-                    "Sans détail mensuel, l'énergie de chauffage ne peut pas être séparée de l'ECS : "
-                    "le coefficient H calibré ci-dessous est donc surestimé. À affiner avec la conso mois par mois.",
-                    style={"fontSize": "13px", "color": "#888"},
-                ),
+                html.H4("Calibration — énergie de chauffage historique"),
                 html.Div(
-                    style={"display": "flex", "gap": "40px", "flexWrap": "wrap"},
+                    style={"display": "flex", "gap": "40px", "flexWrap": "wrap", "marginBottom": "16px"},
                     children=[
                         html.Div([
-                            html.Label("Énergie mazout totale annuelle (kWh)"),
-                            dcc.Input(
-                                id="input-mazout-kwh", type="number",
-                                value=18000, min=0, step=100,
-                                style={"width": "160px", "marginLeft": "8px"},
+                            html.Label("Type d'énergie"),
+                            dcc.RadioItems(
+                                id="radio-type-energie",
+                                options=[{"label": v["label"], "value": k} for k, v in pac.UNITES_ENERGIE.items()],
+                                value="mazout_l",
+                                labelStyle={"display": "block", "marginTop": "4px"},
+                            ),
+                        ]),
+                        html.Div([
+                            html.Label("Mode de saisie"),
+                            dcc.RadioItems(
+                                id="radio-mode-saisie",
+                                options=[
+                                    {"label": "Total annuel", "value": "annuel"},
+                                    {"label": "Mois par mois (sépare l'ECS)", "value": "mensuel"},
+                                ],
+                                value="annuel",
+                                labelStyle={"display": "block", "marginTop": "4px"},
                             ),
                         ]),
                         html.Div([
@@ -374,7 +424,53 @@ app.layout = html.Div(
                                 min=0.70, max=0.95, step=0.01, value=pac.RENDEMENT_CHAUDIERE_DEFAUT,
                                 marks={r: f"{r:.0%}" for r in [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]},
                             ),
-                        ], style={"flex": "1", "minWidth": "300px"}),
+                        ], style={"flex": "1", "minWidth": "280px"}),
+                        html.Div([
+                            html.Label("Prix de l'énergie source (CHF par unité native — L, m³ ou kWh selon le type choisi)"),
+                            dcc.Input(
+                                id="input-prix-source", type="number",
+                                value=1.65, min=0, step=0.01,
+                                style={"width": "140px", "marginLeft": "8px"},
+                            ),
+                        ]),
+                    ],
+                ),
+
+                html.Div(
+                    id="conteneur-saisie-annuelle",
+                    children=[
+                        html.Label("Quantité totale annuelle"),
+                        dcc.Input(
+                            id="input-energie-annuelle", type="number",
+                            value=1800, min=0, step=10,
+                            style={"width": "160px", "marginLeft": "8px"},
+                        ),
+                    ],
+                ),
+                html.Div(
+                    id="conteneur-saisie-mensuelle",
+                    children=[
+                        html.P(
+                            "Une ligne par mois, même année que le sélecteur météo ci-dessus. "
+                            "La régression sépare automatiquement la charge de chauffage (pente) de la "
+                            "charge de base — eau chaude sanitaire — qui existe même en été (ordonnée à l'origine).",
+                            style={"fontSize": "13px", "color": "#888"},
+                        ),
+                        dash_table.DataTable(
+                            id="table-energie-mensuelle",
+                            columns=[
+                                {"name": "Mois", "id": "mois", "editable": False},
+                                {"name": "Quantité", "id": "quantite", "type": "numeric", "editable": True},
+                            ],
+                            data=[
+                                {"mois": m, "quantite": 150}
+                                for m in ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+                                          "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+                            ],
+                            style_cell={"textAlign": "center", "padding": "6px", "fontFamily": "sans-serif", "fontSize": "13px"},
+                            style_header={"fontWeight": "bold", "backgroundColor": "#f5f5f5"},
+                            style_table={"width": "320px"},
+                        ),
                     ],
                 ),
             ],
@@ -452,14 +548,6 @@ app.layout = html.Div(
                                 marks={p: f"{p:.2f}" for p in [0.15, 0.25, 0.35, 0.45, 0.50]},
                             ),
                         ], style={"flex": "1", "minWidth": "280px"}),
-                        html.Div([
-                            html.Label("Prix mazout (CHF/L) — marché volatil, ajuste à ta facture récente"),
-                            dcc.Slider(
-                                id="slider-prix-mazout",
-                                min=0.60, max=2.20, step=0.01, value=1.65,
-                                marks={p: f"{p:.2f}" for p in [0.60, 0.90, 1.20, 1.50, 1.80, 2.10]},
-                            ),
-                        ], style={"flex": "1", "minWidth": "280px"}),
                     ],
                 ),
                 html.Br(),
@@ -468,6 +556,75 @@ app.layout = html.Div(
                 generer_grille_heures(MASQUE_HC_DEFAUT),
             ],
         ),
+                    ],
+                ),
+
+                html.Div(
+                    id="colonne-resume",
+                    style={"flex": "1", "minWidth": "260px", "position": "sticky", "top": "20px"},
+                    children=[
+                        html.H4("Résumé"),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("DH annuel (cible)", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-dh", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Énergie vecteur actuel", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-energie-source", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("COP moyen", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-cop", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Électricité annuelle", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-kwh", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Volume ballon tampon", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-tampon", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Coût vecteur actuel", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-cout-source", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #ddd", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Coût électricité (PAC)", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-cout", style={"fontSize": "20px", "fontWeight": "bold"}, children="—"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"padding": "10px 14px", "border": "1px solid #1f7a1f", "borderRadius": "6px", "marginBottom": "10px"},
+                            children=[
+                                html.Div("Différence de coût (économie)", style={"fontSize": "12px", "color": "#888"}),
+                                html.Div(id="resume-economie", style={"fontSize": "20px", "fontWeight": "bold", "color": "#1f7a1f"}, children="—"),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        ),
+
 
         titre_avec_info("Graph 0 — Température brute à 2m, station de Pully", "temperature_brute"),
         dcc.Graph(id="graph-temperature-brute"),
@@ -494,6 +651,17 @@ app.layout = html.Div(
         dcc.Graph(id="graph-electrique"),
     ],
 )
+
+
+@app.callback(
+    Output("conteneur-saisie-annuelle", "style"),
+    Output("conteneur-saisie-mensuelle", "style"),
+    Input("radio-mode-saisie", "value"),
+)
+def basculer_mode_saisie(mode):
+    if mode == "mensuel":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
 
 
 @app.callback(
@@ -531,24 +699,42 @@ def recolorer_grille(masque):
     Output("graph-tampon", "figure"),
     Output("graph-cop", "figure"),
     Output("graph-electrique", "figure"),
+    Output("resume-dh", "children"),
+    Output("resume-kwh", "children"),
+    Output("resume-cop", "children"),
+    Output("resume-cout", "children"),
+    Output("resume-tampon", "children"),
+    Output("resume-energie-source", "children"),
+    Output("resume-cout-source", "children"),
+    Output("resume-economie", "children"),
+    Input("dropdown-annee", "value"),
     Input("slider-limite-chauffe", "value"),
     Input("slider-consigne", "value"),
     Input("slider-altitude", "value"),
-    Input("input-mazout-kwh", "value"),
+    Input("radio-type-energie", "value"),
+    Input("radio-mode-saisie", "value"),
+    Input("input-energie-annuelle", "value"),
+    Input("table-energie-mensuelle", "data"),
     Input("slider-rendement", "value"),
     Input("slider-horaire-chauffe", "value"),
     Input("slider-temp-depart", "value"),
     Input("slider-prix-hc", "value"),
     Input("slider-prix-hp", "value"),
     Input("store-heures-creuses", "data"),
-    Input("slider-prix-mazout", "value"),
+    Input("input-prix-source", "value"),
     Input("table-cop-constructeur", "data"),
 )
 def mettre_a_jour_graphes(
-    limite_chauffe, consigne, altitude, mazout_kwh, rendement, plage_horaire,
-    temp_depart, prix_hc, prix_hp, masque_heures_creuses, prix_mazout,
+    annee, limite_chauffe, consigne, altitude,
+    type_energie, mode_saisie, energie_annuelle_brute, table_energie_mensuelle_data,
+    rendement, plage_horaire,
+    temp_depart, prix_hc, prix_hp, masque_heures_creuses, prix_source,
     table_cop_data,
 ):
+    # Filtre la série 6 ans chargée une fois au démarrage sur l'année choisie —
+    # aucune donnée moyennée, une vraie année météo complète à la fois.
+    temp_pully = temp_pully_toutes_annees[temp_pully_toutes_annees.index.year == annee]
+
     delta_altitude = altitude - climat.ALTITUDE_STATION_PULLY_M
     temp_construction = climat.corriger_altitude(temp_pully, delta_altitude)
 
@@ -579,13 +765,30 @@ def mettre_a_jour_graphes(
         dh_construction_cible, f"DH — construction à {altitude} m, différentiel à {consigne} °C", "#2ca02c"
     )
 
-    # --- Graph 4 : calibration H puis courbe de puissance (kW) ---
-    mazout_kwh = mazout_kwh or 0
+    # --- Graph 4 : conversion d'unité + calibration H (annuel ou régression mensuelle) ---
+    base_annuelle_estimee_kwh = None  # rempli uniquement en mode mensuel (estimation ECS)
     try:
-        H = pac.calibrer_coefficient_deperdition(
-            dh_construction_historique.sum(), mazout_kwh, rendement
-        )
-        energie_utile_kwh = mazout_kwh * rendement
+        if mode_saisie == "mensuel":
+            quantites_mensuelles = [float(r["quantite"]) for r in table_energie_mensuelle_data]
+            quantite_native_totale = sum(quantites_mensuelles)
+            energie_mensuelle_kwh = [pac.convertir_energie_vers_kwh(q, type_energie) for q in quantites_mensuelles]
+            energie_kwh_totale = sum(energie_mensuelle_kwh)
+
+            dh_mensuel = dh_construction_historique.resample("MS").sum().values
+            resultat_regression = pac.calibrer_coefficient_deperdition_regression(
+                dh_mensuel, energie_mensuelle_kwh, rendement
+            )
+            H = resultat_regression["H"]
+            base_annuelle_estimee_kwh = resultat_regression["base_annuelle_kwh"]
+        else:
+            energie_annuelle_brute = energie_annuelle_brute or 0
+            quantite_native_totale = energie_annuelle_brute
+            energie_kwh_totale = pac.convertir_energie_vers_kwh(energie_annuelle_brute, type_energie)
+            H = pac.calibrer_coefficient_deperdition(
+                dh_construction_historique.sum(), energie_kwh_totale, rendement
+            )
+
+        energie_utile_kwh = energie_kwh_totale * rendement
         # Demande réelle du bâtiment : continue, SANS redistribution (perte physique 24h/24)
         demande_kw = pac.calculer_puissance_horaire_kw(dh_construction_cible, H)
 
@@ -600,6 +803,7 @@ def mettre_a_jour_graphes(
         # Graph 5 : capacité tampon nécessaire pour combler l'écart production/demande
         besoin_tampon_kwh = pac.calculer_besoin_tampon_kwh(puissance_kw, demande_kw)
         delta_t_ballon = pac.calculer_delta_t_ballon(temp_depart, consigne)
+        volume_l = None
         if delta_t_ballon <= 0:
             fig5 = go.Figure()
             fig5.update_layout(
@@ -629,34 +833,55 @@ def mettre_a_jour_graphes(
         cop_masque = cop_horaire.where(puissance_kw > 0)
         fig6 = figure_cop(cop_masque, "COP horaire (données réelles)")
 
-        # Graph 7 : puissance électrique, coût annuel PAC (bi-tarif HC/HP), et comparaison au mazout
-        prix_mazout = prix_mazout or 0
+        # Graph 7 : puissance électrique, coût annuel PAC (bi-tarif HC/HP), et comparaison à la source actuelle
+        prix_source = prix_source or 0  # champ "prix source" : CHF par unité native (L, m³ ou kWh)
         puissance_elec_kw = pac.calculer_puissance_electrique_kw(puissance_kw, cop_horaire)
         detail_cout = pac.calculer_cout_annuel_bitarif_masque_chf(
             puissance_elec_kw, masque_heures_creuses, prix_hc, prix_hp
         )
         cout_annuel_pac_chf = detail_cout["cout_total_chf"]
-        cout_annuel_mazout_chf = pac.calculer_cout_mazout_chf(mazout_kwh, prix_mazout)
-        economie_chf = cout_annuel_mazout_chf - cout_annuel_pac_chf
+        cout_annuel_source_chf = quantite_native_totale * prix_source
+        economie_chf = cout_annuel_source_chf - cout_annuel_pac_chf
+        nom_source = pac.UNITES_ENERGIE[type_energie]["label"]
+        suffixe_ecs = (
+            f" | ECS estimée ~{base_annuelle_estimee_kwh:,.0f} kWh/an".replace(",", "'")
+            if base_annuelle_estimee_kwh is not None else ""
+        )
         fig7 = figure_puissance_electrique(
             puissance_elec_kw,
             (
                 f"Puissance électrique — PAC {cout_annuel_pac_chf:,.0f} CHF/an "
                 f"(HC {detail_cout['kwh_hc']:,.0f} kWh / HP {detail_cout['kwh_hp']:,.0f} kWh) vs "
-                f"mazout {cout_annuel_mazout_chf:,.0f} CHF/an → économie {economie_chf:,.0f} CHF/an"
+                f"{nom_source} {cout_annuel_source_chf:,.0f} CHF/an → économie {economie_chf:,.0f} CHF/an"
+                f"{suffixe_ecs}"
             ).replace(",", "'"),
         )
-    except ValueError:
+        # --- Résumé (colonne de droite) ---
+        resume_dh = f"{dh_construction_cible.sum():,.0f} °C·h".replace(",", "'")
+        resume_kwh = f"{puissance_elec_kw.sum():,.0f} kWh".replace(",", "'")
+        resume_cop = f"{cop_masque.mean():.2f}"
+        resume_cout = f"{cout_annuel_pac_chf:,.0f} CHF".replace(",", "'")
+        resume_tampon = f"{volume_l:,.0f} L".replace(",", "'") if volume_l is not None else "—"
+        resume_energie_source = f"{energie_kwh_totale:,.0f} kWh".replace(",", "'")
+        resume_cout_source = f"{cout_annuel_source_chf:,.0f} CHF".replace(",", "'")
+        resume_economie = f"{economie_chf:,.0f} CHF/an".replace(",", "'")
+    except (ValueError, TypeError, KeyError):
         fig4 = go.Figure()
-        fig4.update_layout(title="Entrez une énergie mazout > 0 pour calibrer H", height=340)
+        fig4.update_layout(title="Entrez une énergie > 0 (ou complète les 12 mois) pour calibrer H", height=340)
         fig5 = go.Figure()
-        fig5.update_layout(title="Entrez une énergie mazout > 0 pour calibrer H", height=320)
+        fig5.update_layout(title="Entrez une énergie > 0 (ou complète les 12 mois) pour calibrer H", height=320)
         fig6 = go.Figure()
-        fig6.update_layout(title="Entrez une énergie mazout > 0 pour calibrer H", height=320)
+        fig6.update_layout(title="Entrez une énergie > 0 (ou complète les 12 mois) pour calibrer H", height=320)
         fig7 = go.Figure()
-        fig7.update_layout(title="Entrez une énergie mazout > 0 pour calibrer H", height=340)
+        fig7.update_layout(title="Entrez une énergie > 0 (ou complète les 12 mois) pour calibrer H", height=340)
+        resume_dh = resume_kwh = resume_cop = resume_cout = resume_tampon = "—"
+        resume_energie_source = resume_cout_source = resume_economie = "—"
 
-    return fig0, fig1, fig2, fig3, fig4, fig5, fig6, fig7
+    return (
+        fig0, fig1, fig2, fig3, fig4, fig5, fig6, fig7,
+        resume_dh, resume_kwh, resume_cop, resume_cout, resume_tampon,
+        resume_energie_source, resume_cout_source, resume_economie,
+    )
 
 
 if __name__ == "__main__":

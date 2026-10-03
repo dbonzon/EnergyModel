@@ -133,6 +133,53 @@ def charger_temperature_meteosuisse(
     return serie
 
 
+def charger_temperature_ogd_meteosuisse(
+    chemin_fichier: str,
+    station_abbr: str = None,
+    colonne_temperature: str = "tre200h0",
+    fuseau_horaire: str = "Europe/Zurich",
+) -> pd.Series:
+    """
+    Charge un export au format OGD (Open Government Data) MétéoSuisse —
+    CSV moderne, séparateur ';', typiquement multi-années (le portail OGD
+    publie par blocs de 10 ans). GÉNÉRIQUE : chemin, station et colonne de
+    température passés en paramètre, rien de codé en dur.
+
+    Remplace charger_temperature_meteosuisse() (ancien format "Climap" à
+    largeur fixe) quand ce format CSV est disponible — le reste du pipeline
+    (correction altitude, calcul DH, calibration H) n'a rien à changer.
+
+    Format attendu : colonnes station_abbr;reference_timestamp;<params...>,
+    timestamp "JJ.MM.AAAA HH:MM" en référence UTC (vérifié empiriquement :
+    aucune heure sautée/dupliquée au changement d'heure dans le fichier brut,
+    contrairement à de l'heure locale) — même conversion UTC -> heure locale
+    que pour l'ancien format, mêmes limites DST documentées là-bas.
+
+    Args:
+        chemin_fichier: chemin vers le CSV OGD
+        station_abbr: code station à filtrer (ex. "PUY") si le fichier en
+            contient plusieurs ; None = ne filtre pas (fichier mono-station)
+        colonne_temperature: nom de la colonne à extraire (tre200h0 =
+            température 2m, moyenne horaire — convention MétéoSuisse)
+        fuseau_horaire: fuseau cible pour la conversion UTC -> heure locale
+
+    Returns:
+        pd.Series indexée par datetime horaire LOCAL (naïve, sans tz), en °C
+    """
+    df = pd.read_csv(chemin_fichier, sep=";")
+    if station_abbr is not None:
+        df = df[df["station_abbr"] == station_abbr]
+
+    timestamps_utc = pd.to_datetime(
+        df["reference_timestamp"], format="%d.%m.%Y %H:%M"
+    ).dt.tz_localize("UTC")
+    timestamps_locaux = timestamps_utc.dt.tz_convert(fuseau_horaire).dt.tz_localize(None)
+
+    serie = pd.Series(df[colonne_temperature].values, index=timestamps_locaux, name="temperature_C")
+    serie = serie.sort_index().interpolate(method="linear").ffill().bfill()
+    return serie
+
+
 def corriger_altitude(
     temp_serie: pd.Series,
     delta_altitude_m: float,
